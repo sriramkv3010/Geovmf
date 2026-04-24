@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Checkpoints and model weights
+*.pth
+best_*.pth
+
+# Results (large arrays; commit only the JSON summaries)
+results/
+*.csv
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Dataset (never commit raw data)
+Data/
+/kaggle/
