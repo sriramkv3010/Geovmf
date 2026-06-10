@@ -1,34 +1,3 @@
-"""
-training/framework.py
-=====================
-DualAGGFramework — end-to-end training and evaluation pipeline that
-combines all components of the AGG + Neuropalsy system.
-
-Training Phases
----------------
-Phase 1 — Healthy gaze estimation
-  Step 1  pretrain()                — L1 regression warm-up (ResNet-18 + FC head)
-  Step 2  build_gpm()               — fit Isomap + SA on CNN features
-  Step 3  train_ip()                — fit Isometric Propagator (feature → PGF)
-  Step 4  sphere_oriented_training() — fine-tune CNN via IP inverse path (SOT)
-
-Phase 2 — Pathological adaptation
-  Stage i   finetune_pathological() — vMF head only, CNN frozen
-  [FIX-3]   build pathological GPM on stable stage-i features
-  Stage ii  joint CNN + vMF fine-tuning
-
-Evaluation
-  evaluate_dual()  — publishes a comparison table:
-      FC baseline | GPM-AGG (healthy) | GPM-AGG (patho) | vMF μ | κ stats
-
-Key fixes implemented
----------------------
-FIX-1  Multi-restart SA, k1/k2 ~ U[0.5, 2.0], patience 30→50
-FIX-2  IP: 200 ep, 2-phase cosine LR; SOT: cosine-annealed LR
-FIX-3  Pathological GPM built BEFORE joint FT (stable feature space)
-FIX-4  κ clamped to [KAPPA_MIN, KAPPA_MAX] via Softplus
-"""
-
 from __future__ import annotations
 
 import json
@@ -63,14 +32,6 @@ from utils.device       import gpu_mem
 
 
 class DualAGGFramework:
-    """
-    Orchestrates the full dual-phase AGG training pipeline.
-
-    Parameters
-    ----------
-    condition : str   — neuropathological condition for Phase 2
-    severity  : float — perturbation severity in [0.0, 1.0]
-    """
 
     def __init__(
         self,
@@ -100,8 +61,6 @@ class DualAGGFramework:
             f"IP_EP={IP_EP}  κ∈[{KAPPA_MIN},{KAPPA_MAX}]"
         )
 
-    # ══ DataLoader factory ════════════════════════════════════════════════════
-
     def _make_loader(self, ds, shuffle: bool, collate_fn=None) -> DataLoader:
         nw = NUM_WORKERS if os.name != "nt" else 0
         kw = dict(
@@ -116,8 +75,6 @@ class DualAGGFramework:
         if collate_fn:
             kw["collate_fn"] = collate_fn
         return DataLoader(ds, **kw)
-
-    # ══ AMP helpers ═══════════════════════════════════════════════════════════
 
     def _fwd(self, imgs: torch.Tensor) -> torch.Tensor:
         imgs = imgs.to(self.device, non_blocking=True)
@@ -147,8 +104,6 @@ class DualAGGFramework:
                 torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
             opt.step()
 
-    # ══ Checkpointing ═════════════════════════════════════════════════════════
-
     def _save_ckpt(self, tag: str) -> str:
         path = os.path.join(CHECKPOINT_DIR, f"ckpt_{self.condition}_{tag}.pth")
         torch.save(
@@ -175,10 +130,6 @@ class DualAGGFramework:
         if obj.get("vmf_head"):
             self.vmf_head.load_state_dict(obj["vmf_head"])
         print(f"  ✓ checkpoint ← {path}")
-
-    # ══ Feature collection ════════════════════════════════════════════════════
-
-    def _collect_features(
         self,
         loader: DataLoader,
         n:      int,
@@ -207,7 +158,6 @@ class DualAGGFramework:
         return f, g
 
     def _val_fc(self, loader: DataLoader) -> float:
-        """Compute mean L1 loss of the FC head on ``loader``."""
         self.cnn.eval()
         self.fc.eval()
         total = 0.0
@@ -225,10 +175,6 @@ class DualAGGFramework:
         return total / max(len(loader), 1)
 
     def _vmf_val_metrics(self, val_loader_p: DataLoader) -> dict:
-        """
-        Compute all publishable vMF validation metrics:
-            val_nll, val_ang_err, kappa_mean/min/max, cone_95_deg.
-        """
         self.cnn.eval()
         self.vmf_head.eval()
         nlls, angs, kappas = [], [], []
@@ -263,22 +209,14 @@ class DualAGGFramework:
             kappa_max   = float(kappas.max()),
             cone_95_deg = cone_95(float(kappas.mean())),
         )
-
-    # ══ PHASE 1: Step 1 — Pretrain ═══════════════════════════════════════════
-
-    def pretrain(
+      
         self,
         train_loader: DataLoader,
         val_loader:   DataLoader,
         epochs: int = PRETRAIN_EP,
         lr:     float = LR,
     ) -> None:
-        """
-        Warm-up phase: train ResNet-18 + linear FC head with L1 loss.
 
-        Saves best validation checkpoint to ``best_cnn.pth`` /
-        ``best_fc.pth`` and restores them at the end.
-        """
         print(f"\n{'=' * 55}\nStep 1: Pretrain ({epochs} ep)\n{'=' * 55}")
         params = list(self.cnn.parameters()) + list(self.fc.parameters())
         opt    = torch.optim.Adam(params, lr=lr, weight_decay=WEIGHT_DECAY)
@@ -339,8 +277,6 @@ class DualAGGFramework:
         self._save_ckpt("pretrain")
         gpu_mem()
 
-    # ══ PHASE 1: Step 2 — Build GPM ═══════════════════════════════════════════
-
     def build_gpm(
         self,
         train_loader: DataLoader,
@@ -364,25 +300,13 @@ class DualAGGFramework:
         self.gpm.fit_sphere_alignment(self.gpm.source_pgf, gazs)
         self._save_ckpt("gpm")
 
-    # ══ PHASE 1: Step 3 — Train IP ═════════════════════════════════════════════
-
     def train_ip(
         self,
         n_samples:  int   = N_SAMPLES,
         ip_epochs:  int   = IP_EP,
         lr:         float = LR,
     ) -> None:
-        """
-        Train the Isometric Propagator with a two-phase cosine LR schedule.
-
-        FIX-2
-        -----
-        Phase A (epochs 1 – ip_epochs//2)   : lr=LR,   cosine-anneal to 1e-5
-        Phase B (epochs ip_epochs//2 – end) : lr=LR/2, cosine-anneal to 1e-6
-
-        Target: IP L1 < 0.05.  Values > 0.05 indicate the feature manifold
-        is not well-structured and will cause SOT to plateau.
-        """
+       
         print(
             f"\n{'=' * 55}\n"
             f"Step 3: Train IP ({ip_epochs} ep, 2-phase LR)\n"
@@ -437,20 +361,13 @@ class DualAGGFramework:
             print("  ⚠ IP L1 > 0.05 — SOT may plateau. "
                   "Check feature quality.")
 
-    # ══ PHASE 1: Step 4 — SOT ══════════════════════════════════════════════════
-
     def sphere_oriented_training(
         self,
         train_loader: DataLoader,
         sot_epochs:   int   = SOT_EP,
         lr:           float = 1e-5,
     ) -> None:
-        """
-        Sphere-Oriented Training: fine-tune CNN via IP inverse path.
-
-        FIX-2: uses CosineAnnealingLR instead of fixed LR, letting the
-        optimiser make larger steps early and refine late.
-        """
+        
         print(f"\n{'=' * 55}\nStep 4: SOT ({sot_epochs} ep)\n{'=' * 55}")
         for p in self.ip.parameters():
             p.requires_grad = False
@@ -512,23 +429,11 @@ class DualAGGFramework:
         self._save_ckpt("sot")
         gpu_mem()
 
-    # ══ PHASE 2 — Pathological fine-tuning ════════════════════════════════════
-
     def finetune_pathological(
         self,
         train_ds: MPIIFaceGazeDataset,
         val_ds:   MPIIFaceGazeDataset,
     ) -> tuple[DataLoader, DataLoader]:
-        """
-        Two-stage pathological adaptation.
-
-        Stage i:  train vMF head with CNN frozen (VMF_EPOCHS).
-        [FIX-3]:  build pathological GPM on stable stage-i features.
-        Stage ii: joint CNN + vMF fine-tuning (JOINT_EPOCHS).
-
-        Returns the (train_loader_patho, val_loader_patho) loaders
-        for subsequent evaluation.
-        """
         print(
             f"\n{'=' * 55}\n"
             f"Phase 2: Pathological fine-tuning "
@@ -550,7 +455,6 @@ class DualAGGFramework:
         print(f"  │ Before FT (FC head) │ {ang_before:6.2f}°"
               f"                         │")
 
-        # ── Stage i: vMF head, CNN frozen ─────────────────────────────────────
         print(f"\n  Stage i: vMF head only ({VMF_EPOCHS} epochs, CNN frozen)")
         for p in self.cnn.parameters():
             p.requires_grad = False
@@ -597,12 +501,10 @@ class DualAGGFramework:
         print(f"  │ After vMF stage-i   │ {best_ang_i:6.2f}°"
               f"                         │")
 
-        # ── FIX-3: Build patho GPM BEFORE joint FT shifts the CNN ─────────────
         print("\n  [FIX-3] Building pathological GPM on stable stage-i features ...")
         self._build_patho_gpm(tl_p, label="stage-i")
         self._save_ckpt("patho_gpm_before_joint")
 
-        # ── Stage ii: Joint CNN + vMF ─────────────────────────────────────────
         print(f"\n  Stage ii: Joint CNN + vMF ({JOINT_EPOCHS} epochs)")
         for p in self.cnn.parameters():
             p.requires_grad = True
@@ -650,8 +552,6 @@ class DualAGGFramework:
             if vm["val_ang_err"] < best_ang_ii:
                 best_ang_ii = vm["val_ang_err"]
                 self._save_ckpt("joint_best")
-
-        # Restore best joint checkpoint
         best_jpath = os.path.join(
             CHECKPOINT_DIR, f"ckpt_{self.condition}_joint_best.pth")
         if os.path.exists(best_jpath):
@@ -686,9 +586,7 @@ class DualAGGFramework:
 
         self._save_ckpt("phase2_final")
         return tl_p, vl_p
-
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
+      
     def _fc_ang_err_on_patho(self, val_loader_p: DataLoader) -> float:
         """Baseline angular error of the FC head vs clean GT labels."""
         self.cnn.eval()
@@ -711,11 +609,7 @@ class DualAGGFramework:
         train_loader_p: DataLoader,
         label: str = "",
     ) -> None:
-        """
-        FIX-3: Build pathological GPM on the CURRENT feature space.
-        Must be called after stage-i vMF training but BEFORE joint FT
-        so that CNN features are stable.
-        """
+  
         self.cnn.eval()
         fp, gn = [], []
         with torch.no_grad():
@@ -749,31 +643,15 @@ class DualAGGFramework:
         flag = "✓" if sa_err < 10 else ("⚠" if sa_err < 14 else "✗")
         print(f"  Patho GPM SA in-sample ({label}): {sa_err:.2f}° {flag}")
 
-    # ══ Evaluation ════════════════════════════════════════════════════════════
-
     def evaluate_dual(
         self,
         val_loader_clean: DataLoader,
         val_loader_patho: DataLoader,
     ) -> dict:
-        """
-        Comprehensive dual-branch evaluation.
 
-        Branch A — healthy:
-            FC baseline, GPM-AGG prediction
-        Branch B — pathological:
-            vMF μ vs clean GT, vMF μ vs noisy GT, κ statistics,
-            GPM-patho prediction
-
-        Returns
-        -------
-        results : dict  — all arrays and summary scalars
-        """
         print(f"\n{'=' * 55}\nDual Evaluation\n{'=' * 55}")
         self.cnn.eval()
         results: dict = {}
-
-        # ── Branch A: Healthy ─────────────────────────────────────────────────
         print("\n  [A] Healthy model ...")
         fc_l, gz_l, ft_l = [], [], []
         with torch.no_grad():
@@ -816,7 +694,6 @@ class DualAGGFramework:
                 f"({impr:+.1f}%)"
             )
 
-        # ── Branch B: Pathological ────────────────────────────────────────────
         print("\n  [B] Pathological model ...")
         fp_l, gc_l, gn_l, mu_l, ka_l = [], [], [], [], []
         with torch.no_grad():
@@ -868,7 +745,6 @@ class DualAGGFramework:
             results.update(gpm_patho=ge_p, gpm_patho_pred=gp_p)
             print(f"  GPM patho: {ge_p.mean():.2f}° ± {ge_p.std():.2f}°")
 
-        # ── Publishable summary table ─────────────────────────────────────────
         print(f"\n  {'─' * 58}")
         print(f"  {'Method':<28} {'Mean':>8} {'Std':>8} {'Median':>8}")
         print(f"  {'─' * 58}")
@@ -893,27 +769,12 @@ class DualAGGFramework:
         print(f"  {'─' * 58}")
         return results
 
-    # ══ Export ════════════════════════════════════════════════════════════════
-
     def export_results(
         self,
         results: dict,
         path:    str = "",
         n_vis:   int = 200,
     ) -> dict:
-        """
-        Serialise summary statistics and sample-level predictions to JSON.
-
-        Parameters
-        ----------
-        results : dict  — output of ``evaluate_dual``
-        path    : str   — output file path (defaults to RESULTS_JSON_TPL)
-        n_vis   : int   — number of per-sample rows to export
-
-        Returns
-        -------
-        out : dict  — the serialised data structure
-        """
         if not path:
             path = RESULTS_JSON_TPL.format(condition=self.condition)
 
@@ -964,7 +825,6 @@ class DualAGGFramework:
                     results["vmf_err_vs_noisy"].mean()),  3),
             )
 
-        # Per-sample healthy rows
         if all(k in results for k in
                ("gt_clean", "gpm_healthy_pred", "fc_pred",
                 "gpm_healthy", "fc")):
@@ -981,7 +841,6 @@ class DualAGGFramework:
                 for i in range(n)
             ]
 
-        # Per-sample pathological rows
         if all(k in results for k in
                ("gt_noisy", "vmf_pred", "vmf_kappa",
                 "vmf_err_vs_noisy", "vmf_err_vs_clean")):
@@ -1005,8 +864,6 @@ class DualAGGFramework:
         print(f"  Exported → {path}")
         return out
 
-    # ══ Full pipeline ═════════════════════════════════════════════════════════
-
     def run_full_pipeline(
         self,
         train_loader: DataLoader,
@@ -1014,13 +871,7 @@ class DualAGGFramework:
         train_ds:     MPIIFaceGazeDataset,
         val_ds:       MPIIFaceGazeDataset,
     ) -> dict:
-        """
-        Execute all phases sequentially and return the evaluation results.
-
-        Phase 1: pretrain → build_gpm → train_ip → SOT
-        Phase 2: finetune_pathological (stage i + ii)
-        Eval:    evaluate_dual → export_results
-        """
+        
         print(
             "\n" + "=" * 55 +
             f"\nDUAL AGG | {self.condition} | {DEVICE}\n" +
