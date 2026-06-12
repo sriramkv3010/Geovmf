@@ -1,25 +1,8 @@
-"""
-utils/device.py
-===============
-Device detection and GPU memory utilities.
-"""
-
 import torch
 from config import USE_CUDA, DEVICE
 
 
 def get_device() -> tuple[torch.device, bool]:
-    """
-    Detect and validate the compute device.
-
-    Performs a small matrix multiply on CUDA to confirm the GPU is functional
-    before committing to it.
-
-    Returns
-    -------
-    device   : torch.device
-    use_cuda : bool
-    """
     if not torch.cuda.is_available():
         print("[Device] CPU only — CUDA not available.")
         return torch.device("cpu"), False
@@ -39,7 +22,6 @@ def get_device() -> tuple[torch.device, bool]:
 
 
 def gpu_mem() -> None:
-    """Print current GPU memory allocation (no-op on CPU)."""
     if USE_CUDA:
         allocated = torch.cuda.memory_allocated() / 1e9
         total     = torch.cuda.get_device_properties(0).total_memory / 1e9
